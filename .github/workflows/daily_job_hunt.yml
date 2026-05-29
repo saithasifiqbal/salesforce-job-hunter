@@ -1,0 +1,52 @@
+# ==============================================================
+#   GitHub Actions — Daily Salesforce Job Hunt
+#   ─────────────────────────────────────────────────────────
+#   Runs job_hunter.py every weekday at 8 AM EST (13:00 UTC).
+#   Results are APPENDED to Google Sheets — never overwritten.
+#   No computer needs to be on.
+#
+#   Required GitHub Secrets (Settings → Secrets → Actions):
+#     APIFY_API_TOKEN         — your Apify API token
+#     GOOGLE_CREDENTIALS_JSON — service account JSON (full content)
+#     GOOGLE_SHEET_ID         — ID from the Google Sheets URL
+# ==============================================================
+
+name: Daily Salesforce Job Hunt
+
+on:
+  schedule:
+    # Mon–Fri at 8 AM EST = 13:00 UTC
+    - cron: '0 13 * * 1-5'
+
+  # "Run workflow" button on the GitHub Actions page for manual runs
+  workflow_dispatch:
+
+jobs:
+  hunt:
+    name: Fetch & Save Salesforce Remote Jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Get the code ───────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ─────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install dependencies ───────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run the job hunter ─────────────────────────────────
+      - name: Run job_hunter.py
+        env:
+          APIFY_API_TOKEN:         ${{ secrets.APIFY_API_TOKEN }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID:         ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python job_hunter.py

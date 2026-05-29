@@ -1,0 +1,15 @@
+# Secrets — never commit these
+.env
+
+# Runtime files — generated locally, not needed in repo
+seen_jobs.json
+debug_raw_jobs.json
+
+# Excel output files
+*.xlsx
+~$*.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
