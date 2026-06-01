@@ -83,10 +83,9 @@ ENFORCE_ANNUAL_SALARY = True
 MIN_EXPERIENCE_YEARS = 5        # reject jobs requiring < 5 yrs
 
 # ── Compensation filter ────────────────────────────────────────
-MIN_ANNUAL_SALARY          = 150_000  # $150,000 / year
-MIN_HOURLY_RATE            = 90       # $90 / hour
-MIN_COMMISSION_OTE         = 150_000  # $150,000 OTE (commission roles)
-STRICT_COMPENSATION_FILTER = False    # False = allow "Not Listed" salary jobs
+MIN_ANNUAL_SALARY  = 150_000  # $150,000 / year
+MIN_HOURLY_RATE    = 90       # $90 / hour
+MIN_COMMISSION_OTE = 150_000  # $150,000 OTE (commission roles)
 
 # ── Output files ──────────────────────────────────────────────
 TIMESTAMP       = datetime.now().strftime("%Y%m%d_%H%M")
@@ -251,29 +250,35 @@ def _parse_year_mentions(text: str) -> list:
     return years
 
 
-def meets_experience_requirement(job: dict) -> bool:
+def meets_experience_requirement(job: dict):
+    """
+    3-way return:
+      True  — confirmed ≥ 5 yrs (senior title with no low explicit years,
+              or explicit years ≥ 5 found in description)
+      False — confirmed < 5 yrs (junior title, or explicit years < 5 found)
+      None  — cannot determine (no seniority signal, no year mentions)
+    """
     title = str(job.get("title", "") or "").lower()
     desc  = str(job.get("description", "") or "")[:3000].lower()
 
-    # Rule 1 — explicit junior signal in title → always reject
+    # Rule 1 — explicit junior signal in title → always False
     if any(sig in title for sig in JUNIOR_TITLE_SIGNALS):
         return False
 
-    # Rule 2 — senior signal in title, but still check description years.
-    # "Senior Salesforce Admin - 3+ years" should still be rejected.
+    # Rule 2 — senior signal in title
     if any(sig in title for sig in SENIOR_TITLE_SIGNALS):
         desc_years = _parse_year_mentions(desc)
         if desc_years and max(desc_years) < MIN_EXPERIENCE_YEARS:
-            return False   # senior title but description explicitly says < 5 yrs
-        return True
+            return False   # "Senior" title but description says < 5 yrs
+        return True        # confirmed senior experience
 
     # Rule 3 — no seniority in title: rely entirely on parsed years
     all_years = _parse_year_mentions(title + " " + desc)
     if all_years:
-        return max(all_years) >= MIN_EXPERIENCE_YEARS
+        return max(all_years) >= MIN_EXPERIENCE_YEARS   # True or False
 
-    # Rule 4 — no years mentioned at all → allow (can't verify)
-    return True
+    # Rule 4 — no years, no seniority signal → genuinely unknown
+    return None
 
 
 def extract_experience_text(job: dict) -> str:
@@ -304,15 +309,19 @@ def extract_experience_text(job: dict) -> str:
 # ==============================================================
 #   💵  COMPENSATION FILTER
 #   ─────────────────────────────────────────────────────────
-#   PASS if ANY of these is true:
-#     • Annual salary  ≥ $150,000
-#     • Hourly rate    ≥ $90 / hour
-#     • Commission/OTE role (expected ≥ $150,000 or OTE not parseable)
-#     • No salary info at all (STRICT_COMPENSATION_FILTER = False)
-#   FAIL if salary IS listed and falls below all thresholds.
+#   3-way return:
+#     True  — confirmed meets threshold ($90/hr, $150k/yr, or commission)
+#     False — confirmed fails (salary IS stated and below ALL thresholds)
+#     None  — no salary information found anywhere (can't determine)
 # ==============================================================
 
-def meets_compensation_requirement(job: dict) -> bool:
+def meets_compensation_requirement(job: dict):
+    """
+    3-way return:
+      True  = confirmed meets threshold
+      False = salary explicitly stated and below every threshold
+      None  = no salary info found at all (genuinely unknown)
+    """
     # ── Step 1: structured salary fields ─────────────────────
     s_min = (job.get("salary_min") if job.get("salary_min") is not None
              else job.get("min_amount"))
@@ -342,27 +351,33 @@ def meets_compensation_requirement(job: dict) -> bool:
     amount = max_f if (max_f and max_f > 0) else min_f
 
     if amount is not None and amount > 0:
+        # We have a definitive structured salary → return True or False
         if s_int == "hour":
             return amount >= MIN_HOURLY_RATE
         elif s_int == "month":
             return (amount * 12) >= MIN_ANNUAL_SALARY
-        else:                              # year / unknown → treat as annual
+        else:
             return amount >= MIN_ANNUAL_SALARY
 
-    # ── Step 2: scan description for salary patterns ──────────
+    # ── Step 2: scan description/title for salary patterns ────
     desc  = str(job.get("description", "") or "")[:3000]
     title = str(job.get("title",       "") or "")
     text  = title + " " + desc
 
-    # Hourly: "$90/hr", "$90 per hour", "$90–$120/hr"
+    found_salary   = False   # did we find ANY salary value in text?
+    found_matching = False   # did we find one that meets the threshold?
+
+    # Hourly: "$90/hr", "$95 per hour", "$90–$120/hr"
     for m in re.findall(
         r'\$([\d,]+(?:\.\d+)?)\s*(?:[-–]\s*\$[\d,]+(?:\.\d+)?)?\s*'
         r'(?:per\s+hour|/\s*hour|/hr\b|hourly)',
         text, re.IGNORECASE
     ):
         try:
-            if float(m.replace(",", "")) >= MIN_HOURLY_RATE:
-                return True
+            rate = float(m.replace(",", ""))
+            found_salary = True
+            if rate >= MIN_HOURLY_RATE:
+                found_matching = True
         except Exception:
             pass
 
@@ -375,12 +390,19 @@ def meets_compensation_requirement(job: dict) -> bool:
             amt = float(raw.replace(",", ""))
             if k_flag:
                 amt *= 1000
-            elif amt < 10000:              # bare "150" likely means $150k
+            elif amt < 10000:
                 amt *= 1000
-            if amt >= MIN_ANNUAL_SALARY:
-                return True
+            if amt > 0:
+                found_salary = True
+                if amt >= MIN_ANNUAL_SALARY:
+                    found_matching = True
         except Exception:
             pass
+
+    if found_matching:
+        return True
+    if found_salary:
+        return False   # salary found in text but all values below threshold
 
     # Commission / OTE roles
     text_lower = text.lower()
@@ -398,13 +420,44 @@ def meets_compensation_requirement(job: dict) -> bool:
                     return True
             except Exception:
                 pass
-        return True   # commission role but OTE not parseable → allow
+        return True   # commission role, OTE not parseable → allow
 
-    # ── Step 3: no salary info found ─────────────────────────
-    if not STRICT_COMPENSATION_FILTER:
-        return True   # can't verify → allow through
+    # ── Step 3: no salary info found anywhere → unknown ───────
+    return None
 
-    return False
+
+# ==============================================================
+#   🔀  COMBINED OR CRITERION CHECK
+#   ─────────────────────────────────────────────────────────
+#   A job passes if it meets ANY ONE of:
+#     • Experience ≥ 5 years
+#     • Hourly rate ≥ $90/hr
+#     • Annual salary ≥ $150,000/yr
+#     • Commission OTE ≥ $150,000/yr
+#
+#   3-way OR logic (True / False / None):
+#     ✅ PASS  — at least one criterion is confirmed True
+#     ❌ FAIL  — at least one is confirmed False, and none are True
+#     ✅ PASS  — all are None (genuinely unknown → allow through)
+#
+#   This prevents the "unknown = True" loophole that let jobs with
+#   explicitly bad experience OR explicitly bad salary sneak through.
+# ==============================================================
+
+def meets_any_criterion(job: dict) -> bool:
+    exp  = meets_experience_requirement(job)   # True / False / None
+    comp = meets_compensation_requirement(job) # True / False / None
+
+    # At least one confirmed True → include
+    if exp is True or comp is True:
+        return True
+
+    # At least one confirmed False and none are True → exclude
+    if exp is False or comp is False:
+        return False
+
+    # Both None (no info either way) → allow through
+    return True
 
 
 # ==============================================================
@@ -845,12 +898,8 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
     if tracker.is_seen(job):
         return None
 
-    # ── Filter 5 AND 6: Experience AND Compensation ───────────
-    # Both must pass. A job with < 5 yrs experience is rejected
-    # even if it has high pay, and vice versa.
-    if not meets_experience_requirement(job):
-        return None
-    if not meets_compensation_requirement(job):
+    # ── Filter 5: Experience OR Compensation (3-way OR logic) ──
+    if not meets_any_criterion(job):
         return None
 
     # ── Mark as seen immediately ──────────────────────────────
@@ -1153,10 +1202,10 @@ def main():
     print(f"\n{'─' * 62}")
     print(f"  📦 Raw jobs from API   : {len(raw_all)}")
 
-    # ── Apply all 6 filters + clean ──────────────────────────
+    # ── Apply all 5 filters + clean ──────────────────────────
     kept = []
     skipped_role = skipped_remote = skipped_date = 0
-    skipped_dup  = skipped_exp   = skipped_comp  = 0
+    skipped_dup  = skipped_criteria = 0
 
     for job in raw_all:
         title = job.get("title", "") or ""
@@ -1173,25 +1222,21 @@ def main():
         if tracker.is_seen(job):
             skipped_dup += 1
             continue
-        # AND logic: both experience AND compensation must pass
-        if not meets_experience_requirement(job):
-            skipped_exp += 1
-            continue
-        if not meets_compensation_requirement(job):
-            skipped_comp += 1
+        # OR logic with 3-way values (True/False/None)
+        if not meets_any_criterion(job):
+            skipped_criteria += 1
             continue
 
         cleaned = filter_and_clean(job, tracker)
         if cleaned:
             kept.append(cleaned)
 
-    print(f"  🚫 Skipped (wrong role)   : {skipped_role}")
-    print(f"  🚫 Skipped (not remote)   : {skipped_remote}")
-    print(f"  🚫 Skipped (too old)      : {skipped_date}")
-    print(f"  🚫 Skipped (duplicate)    : {skipped_dup}")
-    print(f"  🚫 Skipped (exp < 5 yrs)  : {skipped_exp}")
-    print(f"  🚫 Skipped (pay too low)  : {skipped_comp}")
-    print(f"  ✅ New jobs (all filters)  : {len(kept)}")
+    print(f"  🚫 Skipped (wrong role)        : {skipped_role}")
+    print(f"  🚫 Skipped (not remote)        : {skipped_remote}")
+    print(f"  🚫 Skipped (too old >24h)      : {skipped_date}")
+    print(f"  🚫 Skipped (duplicate)         : {skipped_dup}")
+    print(f"  🚫 Skipped (fails exp+pay OR)  : {skipped_criteria}")
+    print(f"  ✅ New jobs (all filters)       : {len(kept)}")
 
     if not kept:
         print("\n  ℹ️  No new jobs found today. "
