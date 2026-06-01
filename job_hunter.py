@@ -1,11 +1,13 @@
 # ==============================================================
 #   JOB HUNTING AI AUTOMATION TOOL  v2.0
 #   ─────────────────────────────────────────────────────────
-#   ✅ Salesforce roles ONLY  (title whitelist + blacklist)
-#   ✅ Remote jobs ONLY       (API flag + post-filter)
+#   ✅ Salesforce roles ONLY   (title whitelist + blacklist)
+#   ✅ Remote jobs ONLY        (API flag + post-filter)
 #   ✅ No duplicates across daily runs  (seen_jobs.json)
-#   ✅ searchTerms batching   (saves Apify credits)
-#   ✅ Formatted Excel        (6 sheets, clickable links)
+#   ✅ searchTerms batching    (saves Apify credits)
+#   ✅ Experience ≥ 5 years    (parsed from description)
+#   ✅ Compensation threshold  ($150k/yr · $90/hr · OTE $150k)
+#   ✅ Google Sheets output    (append-only, cloud accessible)
 #
 #   Powered by: Apify + openclawai/job-board-scraper
 #   API Docs  : https://apify.com/openclawai/job-board-scraper
@@ -76,6 +78,15 @@ HOURS_OLD             = 24      # only jobs posted last 24 h
 JOB_TYPE              = "fulltime"
 COUNTRY_INDEED        = "usa"
 ENFORCE_ANNUAL_SALARY = True
+
+# ── Experience filter ──────────────────────────────────────────
+MIN_EXPERIENCE_YEARS = 5        # reject jobs requiring < 5 yrs
+
+# ── Compensation filter ────────────────────────────────────────
+MIN_ANNUAL_SALARY          = 150_000  # $150,000 / year
+MIN_HOURLY_RATE            = 90       # $90 / hour
+MIN_COMMISSION_OTE         = 150_000  # $150,000 OTE (commission roles)
+STRICT_COMPENSATION_FILTER = False    # False = allow "Not Listed" salary jobs
 
 # ── Output files ──────────────────────────────────────────────
 TIMESTAMP       = datetime.now().strftime("%Y%m%d_%H%M")
@@ -198,6 +209,200 @@ def is_truly_remote(job: dict) -> bool:
         return False
 
     return api_flag or loc_remote or text_remote
+
+
+# ==============================================================
+#   🎓  EXPERIENCE FILTER  — minimum 5 years
+#   ─────────────────────────────────────────────────────────
+#   Rule 1 → Junior title signal (e.g. "entry level") → reject
+#   Rule 2 → Senior title signal (e.g. "Senior", "Lead") → accept
+#   Rule 3 → Parse years from description:
+#              max of all mentioned ranges ≥ 5  → accept
+#              max of all mentioned ranges < 5  → reject
+#   Rule 4 → No years mentioned at all → accept (benefit of doubt)
+# ==============================================================
+
+SENIOR_TITLE_SIGNALS = [
+    "senior", "sr.", "lead", "principal", "staff", "architect",
+    "manager", "director", "vp ", "head of", "expert", "specialist",
+]
+JUNIOR_TITLE_SIGNALS = [
+    "junior", "jr.", "entry level", "entry-level", "associate",
+    "intern", "graduate", "trainee",
+]
+
+
+def meets_experience_requirement(job: dict) -> bool:
+    title = str(job.get("title", "") or "").lower()
+    desc  = str(job.get("description", "") or "")[:3000].lower()
+    text  = title + " " + desc
+
+    # Rule 1 — explicit junior signal in title
+    if any(sig in title for sig in JUNIOR_TITLE_SIGNALS):
+        return False
+
+    # Rule 2 — explicit senior signal in title
+    if any(sig in title for sig in SENIOR_TITLE_SIGNALS):
+        return True
+
+    # Rule 3 — parse year ranges from description
+    all_years = []
+
+    # "3 to 7 years" / "3-7 years"
+    for lo, hi in re.findall(
+        r'(\d+)\s*(?:to|-)\s*(\d+)\s*(?:years?|yrs?)', text
+    ):
+        all_years += [int(lo), int(hi)]
+
+    # "5+ years experience" / "5 years of experience" / "minimum 5 years"
+    for m in re.findall(
+        r'(\d+)\s*\+?\s*(?:years?|yrs?)\s*(?:of\s+)?'
+        r'(?:relevant\s+)?(?:professional\s+)?(?:experience|exp\b)',
+        text
+    ):
+        all_years.append(int(m))
+
+    for m in re.findall(
+        r'(?:minimum|at\s+least|min\.?)\s+(\d+)\s*(?:years?|yrs?)', text
+    ):
+        all_years.append(int(m))
+
+    if all_years:
+        return max(all_years) >= MIN_EXPERIENCE_YEARS
+
+    # Rule 4 — no explicit requirement → allow
+    return True
+
+
+def extract_experience_text(job: dict) -> str:
+    """Returns a display string like '5-8 years' or 'Senior (inferred)'."""
+    title = str(job.get("title", "") or "").lower()
+    desc  = str(job.get("description", "") or "")[:3000].lower()
+    text  = title + " " + desc
+
+    if any(sig in title for sig in JUNIOR_TITLE_SIGNALS):
+        return "Junior (title)"
+    if any(sig in title for sig in SENIOR_TITLE_SIGNALS):
+        return "Senior (title)"
+
+    ranges = re.findall(
+        r'(\d+)\s*(?:to|-)\s*(\d+)\s*(?:years?|yrs?)', text)
+    if ranges:
+        lo, hi = ranges[0]
+        return f"{lo}–{hi} years"
+
+    singles = re.findall(
+        r'(\d+)\s*\+?\s*(?:years?|yrs?)\s*(?:of\s+)?(?:experience|exp\b)', text)
+    if singles:
+        return f"{singles[0]}+ years"
+
+    return "Not specified"
+
+
+# ==============================================================
+#   💵  COMPENSATION FILTER
+#   ─────────────────────────────────────────────────────────
+#   PASS if ANY of these is true:
+#     • Annual salary  ≥ $150,000
+#     • Hourly rate    ≥ $90 / hour
+#     • Commission/OTE role (expected ≥ $150,000 or OTE not parseable)
+#     • No salary info at all (STRICT_COMPENSATION_FILTER = False)
+#   FAIL if salary IS listed and falls below all thresholds.
+# ==============================================================
+
+def meets_compensation_requirement(job: dict) -> bool:
+    # ── Step 1: structured salary fields ─────────────────────
+    s_min = (job.get("salary_min") if job.get("salary_min") is not None
+             else job.get("min_amount"))
+    s_max = (job.get("salary_max") if job.get("salary_max") is not None
+             else job.get("max_amount"))
+    s_int = (job.get("salary_interval")
+             or job.get("salary_period")
+             or job.get("compensation_type") or "").lower()
+
+    interval_map = {
+        "yearly": "year", "annual": "year", "annually": "year",
+        "monthly": "month", "hourly": "hour", "weekly": "week",
+        "hour": "hour", "month": "month", "year": "year",
+    }
+    s_int = interval_map.get(s_int, s_int)
+
+    def to_num(v):
+        if v is None:
+            return None
+        try:
+            return float(str(v).replace(",", "").replace("$", "").strip())
+        except Exception:
+            return None
+
+    min_f  = to_num(s_min)
+    max_f  = to_num(s_max)
+    amount = max_f if (max_f and max_f > 0) else min_f
+
+    if amount is not None and amount > 0:
+        if s_int == "hour":
+            return amount >= MIN_HOURLY_RATE
+        elif s_int == "month":
+            return (amount * 12) >= MIN_ANNUAL_SALARY
+        else:                              # year / unknown → treat as annual
+            return amount >= MIN_ANNUAL_SALARY
+
+    # ── Step 2: scan description for salary patterns ──────────
+    desc  = str(job.get("description", "") or "")[:3000]
+    title = str(job.get("title",       "") or "")
+    text  = title + " " + desc
+
+    # Hourly: "$90/hr", "$90 per hour", "$90–$120/hr"
+    for m in re.findall(
+        r'\$([\d,]+(?:\.\d+)?)\s*(?:[-–]\s*\$[\d,]+(?:\.\d+)?)?\s*'
+        r'(?:per\s+hour|/\s*hour|/hr\b|hourly)',
+        text, re.IGNORECASE
+    ):
+        try:
+            if float(m.replace(",", "")) >= MIN_HOURLY_RATE:
+                return True
+        except Exception:
+            pass
+
+    # Annual: "$150,000", "$150k", "$200K/year"
+    for raw, k_flag in re.findall(
+        r'\$([\d,]+)\s*([kK])?\s*(?:/\s*(?:yr|year)|per\s+year|annually)?',
+        text, re.IGNORECASE
+    ):
+        try:
+            amt = float(raw.replace(",", ""))
+            if k_flag:
+                amt *= 1000
+            elif amt < 10000:              # bare "150" likely means $150k
+                amt *= 1000
+            if amt >= MIN_ANNUAL_SALARY:
+                return True
+        except Exception:
+            pass
+
+    # Commission / OTE roles
+    text_lower = text.lower()
+    is_commission = any(w in text_lower for w in [
+        "commission", "ote", "on-target earning",
+        "variable pay", "performance-based", "incentive compensation",
+    ])
+    if is_commission:
+        for m in re.findall(r'ote[:\s$]*([0-9,]+)\s*[kK]?', text_lower):
+            try:
+                amt = float(m.replace(",", ""))
+                if amt < 10000:
+                    amt *= 1000
+                if amt >= MIN_COMMISSION_OTE:
+                    return True
+            except Exception:
+                pass
+        return True   # commission role but OTE not parseable → allow
+
+    # ── Step 3: no salary info found ─────────────────────────
+    if not STRICT_COMPENSATION_FILTER:
+        return True   # can't verify → allow through
+
+    return False
 
 
 # ==============================================================
@@ -611,11 +816,13 @@ def parse_date(date_raw) -> str:
 
 def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
     """
-    Applies all 3 filters then returns clean dict or None.
+    Applies all 5 filters then returns clean dict or None.
 
-    Filter 1 — Salesforce role check (title whitelist/blacklist)
-    Filter 2 — Remote-only check  (API flag + location/description)
-    Filter 3 — Deduplication      (seen_jobs.json cross-run check)
+    Filter 1 — Salesforce role     (title whitelist/blacklist)
+    Filter 2 — Remote-only         (API flag + location/description)
+    Filter 3 — Deduplication       (seen_jobs.json / Google Sheets)
+    Filter 4 — Experience ≥ 5 yrs  (parsed from description + title)
+    Filter 5 — Compensation        ($150k/yr · $90/hr · OTE $150k)
     """
 
     title   = job.get("title", "") or ""
@@ -631,6 +838,14 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
 
     # ── Filter 3: Duplicate check ─────────────────────────────
     if tracker.is_seen(job):
+        return None
+
+    # ── Filter 4: Experience check ────────────────────────────
+    if not meets_experience_requirement(job):
+        return None
+
+    # ── Filter 5: Compensation check ──────────────────────────
+    if not meets_compensation_requirement(job):
         return None
 
     # ── All filters passed — dump raw data for debug ──────────
@@ -668,7 +883,10 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
                  else str(skills)
 
     # ── Salary source tag (LinkedIn/Indeed indicate origin) ───
-    sal_src    = job.get("salary_source") or ""   # "direct_data" or "description"
+    sal_src    = job.get("salary_source") or ""
+
+    # ── Experience requirement (display only) ─────────────────
+    exp_text   = extract_experience_text(job)
 
     return {
         "Job Title"        : title,
@@ -677,8 +895,9 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
         "Location"         : loc,
         "Remote"           : "✅ Yes",
         "Job Type"         : str(job.get("job_type", JOB_TYPE)).capitalize(),
+        "Experience Req"   : exp_text,
         "Salary"           : salary,
-        "Salary Source"    : sal_src,            # new — shows where salary came from
+        "Salary Source"    : sal_src,
         "Date Posted"      : date_posted,
         "Job Link"         : apply_link,
         "Company Rating"   : job.get("company_rating", ""),
@@ -719,11 +938,11 @@ def save_to_excel(df: pd.DataFrame, filename: str):
         "Job Title"       : 40, "Company Name"  : 26,
         "Platform"        : 14, "Location"      : 22,
         "Remote"          : 11, "Job Type"      : 13,
-        "Salary"          : 32, "Salary Source" : 16,
-        "Date Posted"     : 13, "Job Link"      : 55,
-        "Company Rating"  : 15, "Company Size"  : 18,
-        "Skills Required" : 40, "Description"   : 55,
-        "Scraped On"      : 18,
+        "Experience Req"  : 18, "Salary"        : 32,
+        "Salary Source"   : 16, "Date Posted"   : 13,
+        "Job Link"        : 55, "Company Rating": 15,
+        "Company Size"    : 18, "Skills Required": 40,
+        "Description"     : 55, "Scraped On"    : 18,
     }
 
     def _write_sheet(df_s: pd.DataFrame, name: str):
@@ -789,6 +1008,8 @@ def save_to_excel(df: pd.DataFrame, filename: str):
         "✅ Fully remote jobs only (API flag + location/description check)",
         "✅ New jobs only (cross-run deduplication via seen_jobs.json)",
         f"✅ Posted within last {HOURS_OLD} hours",
+        f"✅ Experience ≥ {MIN_EXPERIENCE_YEARS} years (parsed from description/title)",
+        f"✅ Salary ≥ ${MIN_ANNUAL_SALARY:,}/yr  OR  ≥ ${MIN_HOURLY_RATE}/hr  OR  commission OTE ≥ ${MIN_COMMISSION_OTE:,}",
     ]
     for ri, f in enumerate(filters, start=7 + df["Platform"].nunique() + 2):
         ws3.write(ri, 0, f)
@@ -930,13 +1151,14 @@ def main():
     print(f"\n{'─' * 62}")
     print(f"  📦 Raw jobs from API   : {len(raw_all)}")
 
-    # ── Apply all 3 filters + clean ──────────────────────────
-    kept, skipped_role, skipped_remote, skipped_dup = [], 0, 0, 0
+    # ── Apply all 5 filters + clean ──────────────────────────
+    kept = []
+    skipped_role = skipped_remote = skipped_dup = 0
+    skipped_exp  = skipped_comp  = 0
 
     for job in raw_all:
         title = job.get("title", "") or ""
 
-        # check each filter stage for stats
         if not is_salesforce_role(title):
             skipped_role += 1
             continue
@@ -946,15 +1168,23 @@ def main():
         if tracker.is_seen(job):
             skipped_dup += 1
             continue
+        if not meets_experience_requirement(job):
+            skipped_exp += 1
+            continue
+        if not meets_compensation_requirement(job):
+            skipped_comp += 1
+            continue
 
         cleaned = filter_and_clean(job, tracker)
         if cleaned:
             kept.append(cleaned)
 
-    print(f"  🚫 Skipped (wrong role) : {skipped_role}")
-    print(f"  🚫 Skipped (not remote) : {skipped_remote}")
-    print(f"  🚫 Skipped (duplicate)  : {skipped_dup}")
-    print(f"  ✅ New Salesforce remote : {len(kept)}")
+    print(f"  🚫 Skipped (wrong role)  : {skipped_role}")
+    print(f"  🚫 Skipped (not remote)  : {skipped_remote}")
+    print(f"  🚫 Skipped (duplicate)   : {skipped_dup}")
+    print(f"  🚫 Skipped (exp < 5 yrs) : {skipped_exp}")
+    print(f"  🚫 Skipped (low pay)     : {skipped_comp}")
+    print(f"  ✅ New jobs (all filters) : {len(kept)}")
 
     if not kept:
         print("\n  ℹ️  No new jobs found today. "
