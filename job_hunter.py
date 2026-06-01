@@ -840,12 +840,9 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
     if tracker.is_seen(job):
         return None
 
-    # ── Filter 4: Experience check ────────────────────────────
-    if not meets_experience_requirement(job):
-        return None
-
-    # ── Filter 5: Compensation check ──────────────────────────
-    if not meets_compensation_requirement(job):
+    # ── Filter 4+5: Experience OR Compensation (either is enough) ──
+    if not (meets_experience_requirement(job)
+            or meets_compensation_requirement(job)):
         return None
 
     # ── All filters passed — dump raw data for debug ──────────
@@ -1153,8 +1150,7 @@ def main():
 
     # ── Apply all 5 filters + clean ──────────────────────────
     kept = []
-    skipped_role = skipped_remote = skipped_dup = 0
-    skipped_exp  = skipped_comp  = 0
+    skipped_role = skipped_remote = skipped_dup = skipped_exp = 0
 
     for job in raw_all:
         title = job.get("title", "") or ""
@@ -1168,23 +1164,21 @@ def main():
         if tracker.is_seen(job):
             skipped_dup += 1
             continue
-        if not meets_experience_requirement(job):
+        # OR logic: pass if EITHER experience OR compensation meets threshold
+        if not (meets_experience_requirement(job)
+                or meets_compensation_requirement(job)):
             skipped_exp += 1
-            continue
-        if not meets_compensation_requirement(job):
-            skipped_comp += 1
             continue
 
         cleaned = filter_and_clean(job, tracker)
         if cleaned:
             kept.append(cleaned)
 
-    print(f"  🚫 Skipped (wrong role)  : {skipped_role}")
-    print(f"  🚫 Skipped (not remote)  : {skipped_remote}")
-    print(f"  🚫 Skipped (duplicate)   : {skipped_dup}")
-    print(f"  🚫 Skipped (exp < 5 yrs) : {skipped_exp}")
-    print(f"  🚫 Skipped (low pay)     : {skipped_comp}")
-    print(f"  ✅ New jobs (all filters) : {len(kept)}")
+    print(f"  🚫 Skipped (wrong role)        : {skipped_role}")
+    print(f"  🚫 Skipped (not remote)        : {skipped_remote}")
+    print(f"  🚫 Skipped (duplicate)         : {skipped_dup}")
+    print(f"  🚫 Skipped (exp<5yr AND low pay): {skipped_exp}")
+    print(f"  ✅ New jobs (all filters)       : {len(kept)}")
 
     if not kept:
         print("\n  ℹ️  No new jobs found today. "
