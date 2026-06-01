@@ -232,45 +232,47 @@ JUNIOR_TITLE_SIGNALS = [
 ]
 
 
-def meets_experience_requirement(job: dict) -> bool:
-    title = str(job.get("title", "") or "").lower()
-    desc  = str(job.get("description", "") or "")[:3000].lower()
-    text  = title + " " + desc
-
-    # Rule 1 — explicit junior signal in title
-    if any(sig in title for sig in JUNIOR_TITLE_SIGNALS):
-        return False
-
-    # Rule 2 — explicit senior signal in title
-    if any(sig in title for sig in SENIOR_TITLE_SIGNALS):
-        return True
-
-    # Rule 3 — parse year ranges from description
-    all_years = []
-
-    # "3 to 7 years" / "3-7 years"
+def _parse_year_mentions(text: str) -> list:
+    """Extract all year numbers from experience-related phrases in text."""
+    years = []
     for lo, hi in re.findall(
         r'(\d+)\s*(?:to|-)\s*(\d+)\s*(?:years?|yrs?)', text
     ):
-        all_years += [int(lo), int(hi)]
-
-    # "5+ years experience" / "5 years of experience" / "minimum 5 years"
+        years += [int(lo), int(hi)]
     for m in re.findall(
         r'(\d+)\s*\+?\s*(?:years?|yrs?)\s*(?:of\s+)?'
-        r'(?:relevant\s+)?(?:professional\s+)?(?:experience|exp\b)',
-        text
+        r'(?:relevant\s+)?(?:professional\s+)?(?:experience|exp\b)', text
     ):
-        all_years.append(int(m))
-
+        years.append(int(m))
     for m in re.findall(
         r'(?:minimum|at\s+least|min\.?)\s+(\d+)\s*(?:years?|yrs?)', text
     ):
-        all_years.append(int(m))
+        years.append(int(m))
+    return years
 
+
+def meets_experience_requirement(job: dict) -> bool:
+    title = str(job.get("title", "") or "").lower()
+    desc  = str(job.get("description", "") or "")[:3000].lower()
+
+    # Rule 1 — explicit junior signal in title → always reject
+    if any(sig in title for sig in JUNIOR_TITLE_SIGNALS):
+        return False
+
+    # Rule 2 — senior signal in title, but still check description years.
+    # "Senior Salesforce Admin - 3+ years" should still be rejected.
+    if any(sig in title for sig in SENIOR_TITLE_SIGNALS):
+        desc_years = _parse_year_mentions(desc)
+        if desc_years and max(desc_years) < MIN_EXPERIENCE_YEARS:
+            return False   # senior title but description explicitly says < 5 yrs
+        return True
+
+    # Rule 3 — no seniority in title: rely entirely on parsed years
+    all_years = _parse_year_mentions(title + " " + desc)
     if all_years:
         return max(all_years) >= MIN_EXPERIENCE_YEARS
 
-    # Rule 4 — no explicit requirement → allow
+    # Rule 4 — no years mentioned at all → allow (can't verify)
     return True
 
 
@@ -611,35 +613,6 @@ def fetch_jobs_batch(keyword_batch: list, location: str) -> list:
 
 
 # ==============================================================
-#   🐛  DEBUG HELPER — dumps first N raw jobs to JSON
-#       so you can inspect every field the API actually returns
-# ==============================================================
-
-DEBUG_MODE      = True          # set False to disable
-DEBUG_DUMP_FILE = "debug_raw_jobs.json"
-_debug_saved    = 0             # internal counter
-_debug_limit    = 5             # save first 5 raw jobs per run
-
-
-def debug_dump(job: dict):
-    """Appends raw job dict to debug_raw_jobs.json (first 5 jobs only)."""
-    global _debug_saved
-    if not DEBUG_MODE or _debug_saved >= _debug_limit:
-        return
-    existing = []
-    if os.path.exists(DEBUG_DUMP_FILE):
-        try:
-            with open(DEBUG_DUMP_FILE, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            existing = []
-    existing.append(job)
-    with open(DEBUG_DUMP_FILE, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2, default=str)
-    _debug_saved += 1
-
-
-# ==============================================================
 #   💰  ROBUST SALARY PARSER
 #   Handles all formats LinkedIn / Indeed / Glassdoor return:
 #     • Structured numbers  →  salary_min=120000, salary_max=150000
@@ -810,19 +783,47 @@ def parse_date(date_raw) -> str:
     return s[:20]   # return raw (truncated) so it's not lost
 
 
+def is_recently_posted(job: dict) -> bool:
+    """
+    Client-side date guard — the API's hoursOld param is NOT reliably
+    enforced by LinkedIn / Glassdoor, so old jobs leak through.
+    Rejects any job whose parsed date is older than HOURS_OLD hours.
+    Allows jobs with no/unparseable date (can't reject what we can't read).
+    """
+    date_raw = job.get("date_posted")
+    if not date_raw:
+        return True
+
+    date_str = parse_date(date_raw)
+    if not re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+        return True   # unparseable — allow
+
+    try:
+        posted  = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+        # +1 day buffer so a job posted "23 hours ago" at a different
+        # timezone isn't incorrectly rejected at a day boundary
+        max_age = (HOURS_OLD // 24) + 1
+        cutoff  = (datetime.now() - timedelta(days=max_age)).date()
+        return posted >= cutoff
+    except Exception:
+        return True
+
+
 # ==============================================================
 #   🧹  FILTER + CLEAN A SINGLE JOB
 # ==============================================================
 
 def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
     """
-    Applies all 5 filters then returns clean dict or None.
+    Applies all 6 filters then returns clean dict or None.
 
     Filter 1 — Salesforce role     (title whitelist/blacklist)
     Filter 2 — Remote-only         (API flag + location/description)
-    Filter 3 — Deduplication       (seen_jobs.json / Google Sheets)
-    Filter 4 — Experience ≥ 5 yrs  (parsed from description + title)
-    Filter 5 — Compensation        ($150k/yr · $90/hr · OTE $150k)
+    Filter 3 — Date posted ≤ 24 h  (client-side — API param not reliable)
+    Filter 4 — Deduplication       (seen_jobs.json / Google Sheets)
+    Filter 5 — Experience ≥ 5 yrs  (parsed from description + title)
+    Filter 6 — Compensation AND    ($150k/yr · $90/hr · OTE $150k)
+               Both 5 AND 6 must pass (AND logic).
     """
 
     title   = job.get("title", "") or ""
@@ -836,17 +837,21 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
     if not is_truly_remote(job):
         return None
 
-    # ── Filter 3: Duplicate check ─────────────────────────────
+    # ── Filter 3: Date check (client-side) ───────────────────
+    if not is_recently_posted(job):
+        return None
+
+    # ── Filter 4: Duplicate check ─────────────────────────────
     if tracker.is_seen(job):
         return None
 
-    # ── Filter 4+5: Experience OR Compensation (either is enough) ──
-    if not (meets_experience_requirement(job)
-            or meets_compensation_requirement(job)):
+    # ── Filter 5 AND 6: Experience AND Compensation ───────────
+    # Both must pass. A job with < 5 yrs experience is rejected
+    # even if it has high pay, and vice versa.
+    if not meets_experience_requirement(job):
         return None
-
-    # ── All filters passed — dump raw data for debug ──────────
-    debug_dump(job)
+    if not meets_compensation_requirement(job):
+        return None
 
     # ── Mark as seen immediately ──────────────────────────────
     tracker.mark_seen(job)
@@ -1148,9 +1153,10 @@ def main():
     print(f"\n{'─' * 62}")
     print(f"  📦 Raw jobs from API   : {len(raw_all)}")
 
-    # ── Apply all 5 filters + clean ──────────────────────────
+    # ── Apply all 6 filters + clean ──────────────────────────
     kept = []
-    skipped_role = skipped_remote = skipped_dup = skipped_exp = 0
+    skipped_role = skipped_remote = skipped_date = 0
+    skipped_dup  = skipped_exp   = skipped_comp  = 0
 
     for job in raw_all:
         title = job.get("title", "") or ""
@@ -1161,24 +1167,31 @@ def main():
         if not is_truly_remote(job):
             skipped_remote += 1
             continue
+        if not is_recently_posted(job):
+            skipped_date += 1
+            continue
         if tracker.is_seen(job):
             skipped_dup += 1
             continue
-        # OR logic: pass if EITHER experience OR compensation meets threshold
-        if not (meets_experience_requirement(job)
-                or meets_compensation_requirement(job)):
+        # AND logic: both experience AND compensation must pass
+        if not meets_experience_requirement(job):
             skipped_exp += 1
+            continue
+        if not meets_compensation_requirement(job):
+            skipped_comp += 1
             continue
 
         cleaned = filter_and_clean(job, tracker)
         if cleaned:
             kept.append(cleaned)
 
-    print(f"  🚫 Skipped (wrong role)        : {skipped_role}")
-    print(f"  🚫 Skipped (not remote)        : {skipped_remote}")
-    print(f"  🚫 Skipped (duplicate)         : {skipped_dup}")
-    print(f"  🚫 Skipped (exp<5yr AND low pay): {skipped_exp}")
-    print(f"  ✅ New jobs (all filters)       : {len(kept)}")
+    print(f"  🚫 Skipped (wrong role)   : {skipped_role}")
+    print(f"  🚫 Skipped (not remote)   : {skipped_remote}")
+    print(f"  🚫 Skipped (too old)      : {skipped_date}")
+    print(f"  🚫 Skipped (duplicate)    : {skipped_dup}")
+    print(f"  🚫 Skipped (exp < 5 yrs)  : {skipped_exp}")
+    print(f"  🚫 Skipped (pay too low)  : {skipped_comp}")
+    print(f"  ✅ New jobs (all filters)  : {len(kept)}")
 
     if not kept:
         print("\n  ℹ️  No new jobs found today. "
