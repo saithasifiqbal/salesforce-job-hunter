@@ -67,7 +67,6 @@ SEARCH_KEYWORDS = [
     "Salesforce Engineer",
     "Salesforce Developer",
     "Salesforce Architect",
-    "Salesforce Administrator",
     "Lead Salesforce",
     "Salesforce CPQ Developer",
 ]
@@ -83,9 +82,8 @@ ENFORCE_ANNUAL_SALARY = True
 MIN_EXPERIENCE_YEARS = 5        # reject jobs requiring < 5 yrs
 
 # ── Compensation filter ────────────────────────────────────────
-MIN_ANNUAL_SALARY  = 150_000  # $150,000 / year
-MIN_HOURLY_RATE    = 90       # $90 / hour
-MIN_COMMISSION_OTE = 150_000  # $150,000 OTE (commission roles)
+MIN_ANNUAL_SALARY = 150_000  # $150,000 / year
+MIN_HOURLY_RATE   = 90       # $90 / hour
 
 # ── Output files ──────────────────────────────────────────────
 TIMESTAMP       = datetime.now().strftime("%Y%m%d_%H%M")
@@ -310,16 +308,16 @@ def extract_experience_text(job: dict) -> str:
 #   💵  COMPENSATION FILTER
 #   ─────────────────────────────────────────────────────────
 #   3-way return:
-#     True  — confirmed meets threshold ($90/hr, $150k/yr, or commission)
-#     False — confirmed fails (salary IS stated and below ALL thresholds)
+#     True  — confirmed meets threshold ($150k/yr OR $90/hr)
+#     False — confirmed fails (salary IS stated and below both thresholds)
 #     None  — no salary information found anywhere (can't determine)
 # ==============================================================
 
 def meets_compensation_requirement(job: dict):
     """
     3-way return:
-      True  = confirmed meets threshold
-      False = salary explicitly stated and below every threshold
+      True  = annual salary ≥ $150,000  OR  hourly rate ≥ $90
+      False = salary explicitly stated and below both thresholds
       None  = no salary info found at all (genuinely unknown)
     """
     # ── Step 1: structured salary fields ─────────────────────
@@ -404,24 +402,6 @@ def meets_compensation_requirement(job: dict):
     if found_salary:
         return False   # salary found in text but all values below threshold
 
-    # Commission / OTE roles
-    text_lower = text.lower()
-    is_commission = any(w in text_lower for w in [
-        "commission", "ote", "on-target earning",
-        "variable pay", "performance-based", "incentive compensation",
-    ])
-    if is_commission:
-        for m in re.findall(r'ote[:\s$]*([0-9,]+)\s*[kK]?', text_lower):
-            try:
-                amt = float(m.replace(",", ""))
-                if amt < 10000:
-                    amt *= 1000
-                if amt >= MIN_COMMISSION_OTE:
-                    return True
-            except Exception:
-                pass
-        return True   # commission role, OTE not parseable → allow
-
     # ── Step 3: no salary info found anywhere → unknown ───────
     return None
 
@@ -433,7 +413,6 @@ def meets_compensation_requirement(job: dict):
 #     • Experience ≥ 5 years
 #     • Hourly rate ≥ $90/hr
 #     • Annual salary ≥ $150,000/yr
-#     • Commission OTE ≥ $150,000/yr
 #
 #   3-way OR logic (True / False / None):
 #     ✅ PASS  — at least one criterion is confirmed True
