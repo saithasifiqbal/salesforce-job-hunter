@@ -407,35 +407,43 @@ def meets_compensation_requirement(job: dict):
 
 
 # ==============================================================
-#   🔀  COMBINED OR CRITERION CHECK
+#   🔀  COMBINED CRITERION CHECK
 #   ─────────────────────────────────────────────────────────
-#   A job passes if it meets ANY ONE of:
-#     • Experience ≥ 5 years
-#     • Hourly rate ≥ $90/hr
-#     • Annual salary ≥ $150,000/yr
+#   Logic:  Experience ≥ 5 yrs  AND  (Salary ≥ $150k  OR  Hourly ≥ $90)
 #
-#   3-way OR logic (True / False / None):
-#     ✅ PASS  — at least one criterion is confirmed True
-#     ❌ FAIL  — at least one is confirmed False, and none are True
-#     ✅ PASS  — all are None (genuinely unknown → allow through)
+#   3-way values per criterion: True (confirmed) / False (confirmed) / None (unknown)
 #
-#   This prevents the "unknown = True" loophole that let jobs with
-#   explicitly bad experience OR explicitly bad salary sneak through.
+#   Decision table:
+#     exp=True,  comp=True  → ✅ PASS  both confirmed
+#     exp=True,  comp=False → ❌ FAIL  good exp but pay too low
+#     exp=True,  comp=None  → ✅ PASS  good exp, salary unknown — allow
+#     exp=False, comp=*     → ❌ FAIL  experience is mandatory
+#     exp=None,  comp=True  → ✅ PASS  high pay implies seniority — allow
+#     exp=None,  comp=False → ❌ FAIL  exp unknown AND pay confirmed low
+#     exp=None,  comp=None  → ✅ PASS  both unknown — allow through
 # ==============================================================
 
 def meets_any_criterion(job: dict) -> bool:
     exp  = meets_experience_requirement(job)   # True / False / None
     comp = meets_compensation_requirement(job) # True / False / None
 
-    # At least one confirmed True → include
-    if exp is True or comp is True:
-        return True
-
-    # At least one confirmed False and none are True → exclude
-    if exp is False or comp is False:
+    # Experience explicitly failed → always reject (it is mandatory)
+    if exp is False:
         return False
 
-    # Both None (no info either way) → allow through
+    # Compensation confirmed too low AND experience not confirmed → reject
+    if comp is False and exp is not True:
+        return False
+
+    # Experience confirmed → accept unless compensation is explicitly too low
+    if exp is True:
+        return comp is not False   # True or None both pass
+
+    # Experience unknown + compensation confirmed high → accept
+    if comp is True:
+        return True
+
+    # Both unknown → allow through for manual review
     return True
 
 
@@ -877,7 +885,7 @@ def filter_and_clean(job: dict, tracker: SeenJobsTracker) -> dict | None:
     if tracker.is_seen(job):
         return None
 
-    # ── Filter 5: Experience OR Compensation (3-way OR logic) ──
+    # ── Filter 5: Experience AND (Salary OR Hourly) ──────────
     if not meets_any_criterion(job):
         return None
 
